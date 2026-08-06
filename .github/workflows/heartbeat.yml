@@ -69,7 +69,7 @@ jobs:
           OUT=$(ssh -p "${{ secrets.SSH_PORT }}" \
                     -o BatchMode=yes -o ConnectTimeout=30 \
                     "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
-                    'cd ~/bots && setsid nohup bash ~/bots/keepalive.sh </dev/null >/dev/null 2>&1 & sleep 8; ps -u $(id -un) -o cmd= | grep -c -- "bots/keepalive.sh"; ps -u $(id -un) -o cmd= | grep -c -- "telegram-collect-bot/bot.js"; ps -u $(id -un) -o cmd= | grep -c -- "telegram_bot/supervisor.py"' 2>&1) || rc=$?
+                    'cd ~/bots && setsid nohup bash ~/bots/keepalive.sh </dev/null >/dev/null 2>&1 & sleep 10; bash ~/bots/status.sh' 2>&1) || rc=$?
           echo "--- remote output (ssh exit $rc) ---"
           echo "$OUT"
           echo "------------------------------------"
@@ -77,21 +77,30 @@ jobs:
             echo "::error::ssh failed with exit $rc"
             exit 1
           fi
-          # last three lines are the three counts
-          KEEP=$(echo "$OUT" | tail -3 | head -1)
-          COLLECT=$(echo "$OUT" | tail -2 | head -1)
-          STATS=$(echo "$OUT" | tail -1)
-          echo "keepalive=$KEEP collect=$COLLECT stats=$STATS"
-          {
-            echo "keepalive=$KEEP"
-            echo "collect=$COLLECT"
-            echo "stats=$STATS"
-          } >> "$GITHUB_OUTPUT"
-          if [ "$KEEP" -lt 1 ] || [ "$COLLECT" -lt 1 ] || [ "$STATS" -lt 1 ]; then
-            echo "::error::a bot is not running (keepalive=$KEEP collect=$COLLECT stats=$STATS)"
+
+          # status.sh prints one parseable line: keepalive=1 collect=1 ...
+          # Counting is done there, on /proc, precisely because a `ps | grep -c`
+          # run over ssh counts the ssh command line itself and therefore can
+          # never report 0 — it would pass while every bot was dead.
+          STATUS=$(echo "$OUT" | grep -E '^keepalive=' | tail -1)
+          if [ -z "$STATUS" ]; then
+            echo "::error::status.sh produced no parseable output"
             exit 1
           fi
-          echo "✔ all three alive"
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+
+          bad=""
+          for kv in $STATUS; do
+            name=${kv%%=*}; n=${kv#*=}
+            # exactly 1 is the only healthy value: 0 = down, >1 = duplicate
+            # processes posting to the same channels twice.
+            [ "$n" = "1" ] || bad="$bad $name=$n"
+          done
+          if [ -n "$bad" ]; then
+            echo "::error::unhealthy process count:$bad (each must be exactly 1)"
+            exit 1
+          fi
+          echo "✔ all five processes healthy — exactly one of each"
 
       - name: Run the site uptime check
         # ~/bin/uptime-check.sh was written 2026-07-11 to watch dailygrowers.com
@@ -122,5 +131,5 @@ jobs:
         run: |
           curl -s -m 20 "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
             --data-urlencode "chat_id=${{ secrets.TG_CHAT }}" \
-            --data-urlencode "text=🚨 bots-heartbeat FAILED — could not reach the server or a bot would not start. keepalive=${{ steps.ensure.outputs.keepalive }} collect=${{ steps.ensure.outputs.collect }} stats=${{ steps.ensure.outputs.stats }}. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --data-urlencode "text=🚨 bots-heartbeat FAILED — could not reach the server or a bot would not start. ${{ steps.ensure.outputs.status }}. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             > /dev/null
