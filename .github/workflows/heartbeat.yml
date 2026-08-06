@@ -1,0 +1,89 @@
+# ==================================================================
+# Heartbeat for the two statistics bots running on the Hostinger server.
+#
+# WHY THIS EXISTS
+# The bots are kept alive on the server by ~/bots/keepalive.sh, which runs
+# ~/bots/watchdog.sh every 60s and restarts anything that died. That covers
+# crashes. What it CANNOT cover is its own death — a server reboot or a
+# hosting-side process reaper kills keepalive along with everything else, and
+# nothing is left to restart it.
+#
+# Normally that gap is closed by cron. This Hostinger account has NO working
+# cron (verified 2026-08-05: no crontab/crond binary, empty /var/spool/cron,
+# and ~/bin/uptime-check.sh had never once been executed since being written).
+# So the heartbeat has to come from outside the server. That is this workflow.
+#
+# It is deliberately in a PUBLIC repo: Actions minutes are unmetered for public
+# repositories, so a 10-minute heartbeat is free. The repo holds only this
+# file — no bot code, no credentials. The SSH key lives in encrypted repo
+# secrets and is a dedicated key used for nothing else.
+# ==================================================================
+name: bots-heartbeat
+
+on:
+  schedule:
+    # every 10 minutes. GitHub's scheduler is best-effort and often runs a few
+    # minutes late under load — fine here, this is a backstop for a rare event,
+    # not the primary supervisor (that is keepalive.sh, at 60s).
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}   # lets you trigger it by hand from the Actions tab
+
+concurrency:
+  # never let a slow run overlap the next scheduled one
+  group: heartbeat
+  cancel-in-progress: false
+
+jobs:
+  ensure-bots-running:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Pin the host key instead of using StrictHostKeyChecking=no, so this
+          # cannot be silently pointed at an impostor host.
+          echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Ensure keepalive + both bots are running
+        id: ensure
+        run: |
+          set -o pipefail
+          # keepalive.sh self-guards with flock, so launching it when it is
+          # already running is a no-op. It immediately runs watchdog.sh, which
+          # restarts whichever bot is down. Both scripts are idempotent, which
+          # is what makes it safe to fire this every 10 minutes forever.
+          OUT=$(ssh -p "${{ secrets.SSH_PORT }}" \
+                    -o BatchMode=yes -o ConnectTimeout=30 \
+                    "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+                    'cd ~/bots && setsid nohup bash ~/bots/keepalive.sh </dev/null >/dev/null 2>&1 & sleep 8; ps -u $(id -un) -o cmd= | grep -c -- "bots/keepalive.sh"; ps -u $(id -un) -o cmd= | grep -c -- "telegram-collect-bot/bot.js"; ps -u $(id -un) -o cmd= | grep -c -- "telegram_bot/supervisor.py"' 2>&1)
+          echo "$OUT"
+          # last three lines are the three counts
+          KEEP=$(echo "$OUT" | tail -3 | head -1)
+          COLLECT=$(echo "$OUT" | tail -2 | head -1)
+          STATS=$(echo "$OUT" | tail -1)
+          echo "keepalive=$KEEP collect=$COLLECT stats=$STATS"
+          {
+            echo "keepalive=$KEEP"
+            echo "collect=$COLLECT"
+            echo "stats=$STATS"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$KEEP" -lt 1 ] || [ "$COLLECT" -lt 1 ] || [ "$STATS" -lt 1 ]; then
+            echo "::error::a bot is not running (keepalive=$KEEP collect=$COLLECT stats=$STATS)"
+            exit 1
+          fi
+          echo "✔ all three alive"
+
+      - name: Alert Telegram if the heartbeat failed
+        # Fires when SSH itself failed (server unreachable) or a bot could not
+        # be brought up. The watchdog already alerts on ordinary crash+restart,
+        # so this only speaks up about things the server cannot self-heal.
+        if: failure()
+        run: |
+          curl -s -m 20 "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+            --data-urlencode "chat_id=${{ secrets.TG_CHAT }}" \
+            --data-urlencode "text=🚨 bots-heartbeat FAILED — could not reach the server or a bot would not start. keepalive=${{ steps.ensure.outputs.keepalive }} collect=${{ steps.ensure.outputs.collect }} stats=${{ steps.ensure.outputs.stats }}. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            > /dev/null
