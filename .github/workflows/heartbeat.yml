@@ -77,6 +77,27 @@ jobs:
           fi
           echo "✔ all three alive"
 
+      - name: Run the site uptime check
+        # ~/bin/uptime-check.sh was written 2026-07-11 to watch dailygrowers.com
+        # every 30 minutes via cron. There is no cron on this account, so it had
+        # never executed once — its atime still equalled its ctime three weeks
+        # later, and every outage since went unreported. The script itself is
+        # fine (verified by hand), it only ever lacked a scheduler. Now that this
+        # workflow is that scheduler, it runs here too.
+        #
+        # It keeps its own state in ~/bin/.uptime-down and alerts on the first
+        # failure and every 6th after, so a long outage stays quiet-ish rather
+        # than messaging every 10 minutes.
+        #
+        # continue-on-error: a site outage must not mark the bot heartbeat as
+        # failed — they are independent concerns and the script alerts on its own.
+        continue-on-error: true
+        run: |
+          ssh -p "${{ secrets.SSH_PORT }}" \
+              -o BatchMode=yes -o ConnectTimeout=30 \
+              "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+              'bash ~/bin/uptime-check.sh && echo "uptime check ran"'
+
       - name: Alert Telegram if the heartbeat failed
         # Fires when SSH itself failed (server unreachable) or a bot could not
         # be brought up. The watchdog already alerts on ordinary crash+restart,
