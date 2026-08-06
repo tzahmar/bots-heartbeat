@@ -22,9 +22,15 @@ name: bots-heartbeat
 
 on:
   schedule:
-    # every 10 minutes. GitHub's scheduler is best-effort and often runs a few
-    # minutes late under load — fine here, this is a backstop for a rare event,
-    # not the primary supervisor (that is keepalive.sh, at 60s).
+    # Requested every 10 minutes, but DO NOT read that as a guarantee.
+    # GitHub's scheduler is explicitly best-effort and drops runs under load;
+    # measured on this repo over its first 6.7 hours, only 2 scheduled runs
+    # actually fired (~1 per 2.75h), not the ~40 that */10 implies.
+    #
+    # That is acceptable here only because this is a backstop for a rare event
+    # (server reboot / host-side reaper). The primary supervisor is keepalive.sh
+    # on the server, which checks every 60s and needs no external help. If the
+    # bots ever depend on THIS for timely recovery, that assumption is wrong.
     - cron: '*/10 * * * *'
   workflow_dispatch: {}   # lets you trigger it by hand from the Actions tab
 
