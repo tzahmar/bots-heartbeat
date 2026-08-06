@@ -41,26 +41,42 @@ jobs:
       - name: Set up SSH key
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          # printf, not echo: OpenSSH rejects a private key that does not end in
+          # a newline with a bare "invalid format" and no further explanation.
+          printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           # Pin the host key instead of using StrictHostKeyChecking=no, so this
           # cannot be silently pointed at an impostor host.
-          echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          printf '%s\n' "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
+          # Fail here, loudly, if the key did not survive the secret round-trip,
+          # rather than surfacing later as an opaque ssh exit 255.
+          ssh-keygen -y -f ~/.ssh/id_ed25519 > /dev/null && echo "private key parses OK"
+          ssh-keygen -lf ~/.ssh/known_hosts | sed 's/^/  pinned host key: /'
 
       - name: Ensure keepalive + both bots are running
         id: ensure
         run: |
-          set -o pipefail
           # keepalive.sh self-guards with flock, so launching it when it is
           # already running is a no-op. It immediately runs watchdog.sh, which
           # restarts whichever bot is down. Both scripts are idempotent, which
           # is what makes it safe to fire this every 10 minutes forever.
+          #
+          # Capture with "|| rc=$?" rather than letting set -e abort on the
+          # assignment: otherwise a failing ssh kills the step before $OUT is
+          # ever printed, and the run shows exit 255 with no explanation at all.
+          rc=0
           OUT=$(ssh -p "${{ secrets.SSH_PORT }}" \
                     -o BatchMode=yes -o ConnectTimeout=30 \
                     "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
-                    'cd ~/bots && setsid nohup bash ~/bots/keepalive.sh </dev/null >/dev/null 2>&1 & sleep 8; ps -u $(id -un) -o cmd= | grep -c -- "bots/keepalive.sh"; ps -u $(id -un) -o cmd= | grep -c -- "telegram-collect-bot/bot.js"; ps -u $(id -un) -o cmd= | grep -c -- "telegram_bot/supervisor.py"' 2>&1)
+                    'cd ~/bots && setsid nohup bash ~/bots/keepalive.sh </dev/null >/dev/null 2>&1 & sleep 8; ps -u $(id -un) -o cmd= | grep -c -- "bots/keepalive.sh"; ps -u $(id -un) -o cmd= | grep -c -- "telegram-collect-bot/bot.js"; ps -u $(id -un) -o cmd= | grep -c -- "telegram_bot/supervisor.py"' 2>&1) || rc=$?
+          echo "--- remote output (ssh exit $rc) ---"
           echo "$OUT"
+          echo "------------------------------------"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::ssh failed with exit $rc"
+            exit 1
+          fi
           # last three lines are the three counts
           KEEP=$(echo "$OUT" | tail -3 | head -1)
           COLLECT=$(echo "$OUT" | tail -2 | head -1)
