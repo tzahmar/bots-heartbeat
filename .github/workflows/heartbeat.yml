@@ -106,7 +106,7 @@ jobs:
             echo "::error::unhealthy process count:$bad (each must be exactly 1)"
             exit 1
           fi
-          echo "✔ all five processes healthy — exactly one of each"
+          echo "✔ all processes healthy — exactly one of each ($STATUS)"
 
       - name: Run the site uptime check
         # ~/bin/uptime-check.sh was written 2026-07-11 to watch dailygrowers.com
